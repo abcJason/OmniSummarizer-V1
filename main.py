@@ -193,8 +193,8 @@ def generate_summary_node(state: OmniState) -> Dict[str, Any]:
     print("\n--- [節點 3] AI 正在撰寫摘要 ---")
 
     # 1. 檢查前一步驟是否有錯誤
-    if state.get("error"):
-        print("偵測到前一步驟錯誤，跳過生成。")
+    if state.get("error") and not state.get("file_obj"):
+        print("偵測到前一步驟錯誤且無備用檔案，跳過生成。")
         return {"summary": f"無法生成摘要，原因：{state['error']}"}
 
     # 2. 初始化 Gemini
@@ -205,9 +205,8 @@ def generate_summary_node(state: OmniState) -> Dict[str, Any]:
 
     # 3. 設定提示詞 (Prompt)
     # 我們明確要求：不管原文是什麼，都要用繁體中文回答
-    system_prompt = (
-        "你是一位全能的資訊整理專家。請閱讀以下內容（來源：{source_type}），"
-        "並為我撰寫一份「懶人包摘要」。"
+    base_requirements = (
+        "你是一位全能的資訊整理專家。請為我撰寫一份「懶人包摘要」。"
         "\n\n"
         "【要求】：\n"
         "1. **語言**：無論原文是哪國語言，請全部翻譯並整理成 **繁體中文 (Traditional Chinese)**。\n"
@@ -216,8 +215,6 @@ def generate_summary_node(state: OmniState) -> Dict[str, Any]:
         "   - **關鍵重點**：列出 3-5 個最重要的資訊點 (Bullet points)。\n"
         "   - **詳細摘要**：針對內容進行邏輯分段的詳細說明。\n"
         "3. **語氣**：專業但輕鬆，適合快速閱讀。"
-        "\n\n"
-        "【內容】：\n{content}"
     )
 
     try:
@@ -227,14 +224,34 @@ def generate_summary_node(state: OmniState) -> Dict[str, Any]:
         if state.get("file_obj"):
             # 【情況 A】：有檔案 (音訊)
             print("模式：聽覺處理 (Audio Processing)")
+
+            # --- 增加 Debug 資訊 ---
+            file_obj = state["file_obj"]
+            print(f"DEBUG: 檔案 URI: {file_obj.uri}")
+            print(f"DEBUG: 檔案類型: {file_obj.mime_type}")
+
+            # 確保檔案已經處理完成 (通常音訊很快，但檢查一下比較保險)
+            import time
+
+            while file_obj.state.name == "PROCESSING":
+                print("DEBUG: Google 正在處理檔案中，等待 2 秒...")
+                time.sleep(2)
+                file_obj = genai.get_file(file_obj.name)  # 重新整理狀態
+
+            if file_obj.state.name == "FAILED":
+                raise ValueError("Google 無法處理此音訊檔案")
+
+            # 針對音訊的提示詞 (不能有 {content} 佔位符)
+            audio_prompt = base_requirements + "\n\n請根據附檔的音訊內容進行摘要。"
+
             # 這是 LangChain 傳遞多模態檔案的標準寫法
             message = HumanMessage(
                 content=[
-                    {"type": "text", "text": system_prompt},
+                    {"type": "text", "text": audio_prompt},
                     {
                         "type": "media",
-                        "mime_type": state["file_obj"].mime_type,
-                        "data": state["file_obj"].uri,
+                        "mime_type": file_obj.mime_type,
+                        "file_uri": file_obj.uri,
                     },
                 ]
             )
@@ -243,15 +260,21 @@ def generate_summary_node(state: OmniState) -> Dict[str, Any]:
         elif state.get("content"):
             # 【情況 B】：有文字 (字幕/網頁)
             print("模式：文字閱讀 (Text Processing)")
-            messages = [
-                HumanMessage(
-                    content=system_prompt + f"\n\n【內容】：\n{state['content']}"
-                )
-            ]
+
+            # 針對文字的提示詞 (把內容填進去)
+            source = state.get("source_type", "unknown")
+            text_prompt = (
+                base_requirements
+                + f"\n\n來源類型：{source}\n【內容】：\n{state['content']}"
+            )
+
+            messages = [HumanMessage(content=text_prompt)]
+
         else:
             return {"summary": "錯誤：沒有內容也沒有檔案可以處理。"}
 
         # 呼叫 AI
+        print("正在呼叫 Gemini 生成摘要 (這可能需要幾秒鐘)...")
         response = llm.invoke(messages)
 
         print("摘要生成完成！")
@@ -317,7 +340,7 @@ if __name__ == "__main__":
 
     # --- 測試案例 ---
     # 案例 A: 你的 YouTube 影片 (測試多語言翻譯能力 + 字幕抓取)
-    input_data = "https://www.youtube.com/watch?v=M89pzPpyzpg"
+    input_data = "https://www.youtube.com/watch?v=YTiBMEzU9Vc"
 
     # 案例 B: 網頁 (你可以把上面註解掉，換測這個)
     # input_data = "https://blog.langchain.dev/langgraph-multi-agent-workflows/"
