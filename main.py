@@ -1,58 +1,41 @@
 import os
-import re  # 用來做正規表達式判斷 (Regex)
+import re
+import time
 from dotenv import load_dotenv
 
-# 新增這個：Google 原生 SDK (用來上傳檔案)
 import google.generativeai as genai
-import yt_dlp  # 用來下載 YouTube 音軌
+import yt_dlp
 
-# --- 1. 初始化環境與 API Key ---
+# --- 1. 初始化環境 ---
 load_dotenv()
-my_api_key = os.environ.get("MY_GEMINI_KEY")
-if not my_api_key:
-    print("❌ 錯誤：找不到 MY_GEMINI_KEY")
-    exit(1)
+default_api_key = os.environ.get("MY_GEMINI_KEY")
 
-# 【新增】：設定 Google GenAI SDK
-genai.configure(api_key=my_api_key)
-
-# --- 2. 匯入必要的 LangChain 與工具庫 ---
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Annotated
 from typing_extensions import TypedDict
+import operator  # 用來做列表的合併 (append)
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-
-# 網頁與 YouTube 載入器
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_community.document_loaders import YoutubeLoader
-
-from langchain_core.messages import HumanMessage  # 新增這個：用來建構多模態訊息
-
-# LangGraph 元件
+from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, END
 
 
 # --- 3. 定義狀態 (State) ---
-# 這是我們 V1 版本的資料結構，所有節點都只會讀寫這個字典
 class OmniState(TypedDict):
-    input_text: str  # 使用者最原始的輸入 (網址或文字)
-    source_type: str  # 判斷結果：'youtube', 'web', 'text'
-    content: Optional[str]  # 抓取並清洗後的「純文字」內容
-    summary: Optional[str]  # 最終生成的摘要
-    error: Optional[str]  # 如果中間出錯，記錄錯誤訊息
-    file_obj: Any  # 存放上傳後的檔案物件 (如果是音訊處理的話)
+    input_text: str
+    source_type: str
+    content: Optional[str]
+    summary: Optional[str]
+    error: Optional[str]
+    file_obj: Any
+    api_key: Optional[str]
+    # 【新增】日誌列表：使用 operator.add 讓每個節點的回傳值自動 "Append" 進去，而不是覆蓋
+    logs: Annotated[List[str], operator.add]
 
 
-# --- 4. 輔助函式：判斷輸入類型 ---
+# --- 4. 輔助函式 ---
 def detect_source_type(input_text: str) -> str:
-    """
-    簡單的規則判斷：
-    1. 包含 youtube.com 或 youtu.be -> 'youtube'
-    2. 包含 http:// 或 https:// -> 'web'
-    3. 其他 -> 'text'
-    """
     text = input_text.strip().lower()
     if "youtube.com" in text or "youtu.be" in text:
         return "youtube"
@@ -62,232 +45,281 @@ def detect_source_type(input_text: str) -> str:
         return "text"
 
 
-# --- 5. 節點 (Node)：路由器 (分析輸入) ---
+# --- 4.5 新增輔助函式：提取 Video ID ---
+def extract_video_id(url: str) -> Optional[str]:
+    """從 YouTube 網址中提取 Video ID"""
+    # 支援 https://www.youtube.com/watch?v=VIDEO_ID 和 https://youtu.be/VIDEO_ID
+    patterns = [
+        r"(?:v=|\/)([0-9A-Za-z_-]{11}).*",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
+# --- 5. 節點：路由器 ---
 def analyze_input_node(state: OmniState) -> Dict[str, Any]:
-    print("\n--- [節點 1] 分析輸入類型 ---")
-    user_input = state["input_text"]
-    source_type = detect_source_type(user_input)
-
-    print(f"偵測結果: {source_type}")
-    # 回傳更新 state
-    return {"source_type": source_type}
+    source_type = detect_source_type(state["input_text"])
+    log_msg = f"--- [節點 1] 分析輸入 ---\n偵測結果: {source_type}"
+    print(log_msg)  # 保留後台 print 方便除錯
+    return {"source_type": source_type, "logs": [log_msg]}
 
 
-# --- 6. 節點 (Node)：YouTube 載入器 ---
+# --- 6. 節點：YouTube (V2.1 yt-dlp 全能版) ---
 def load_youtube_node(state: OmniState) -> Dict[str, Any]:
-    print("\n--- [節點 2-A] 處理 YouTube ---")
     url = state["input_text"]
+    logs = ["--- [節點 2-A] 處理 YouTube ---"]
 
-    try:
-        print("1. 嘗試下載字幕...")
-        # 優先找中文，然後英文，接著是日韓法德西俄等常見語言
-        common_languages = [
+    # 設定 API Key
+    current_key = state.get("api_key") or default_api_key
+    if current_key:
+        genai.configure(api_key=current_key)
+
+    # === Plan A: 使用 yt-dlp 下載字幕 (省 Token 模式) ===
+    logs.append("嘗試使用 yt-dlp 下載字幕 (Plan A)...")
+
+    # 產生唯一的暫存檔前綴 (避免多執行緒衝突)
+    import uuid
+
+    file_prefix = f"sub_{uuid.uuid4().hex[:8]}"
+
+    # yt-dlp 設定：只抓字幕，不抓影片
+    ydl_opts_sub = {
+        "skip_download": True,  # 關鍵：不下載影片檔
+        "writeautomaticsub": True,  # 嘗試抓自動產生的字幕 (通常都有)
+        "writesubtitles": True,  # 嘗試抓手動上傳的字幕
+        "sublangs": [
             "zh-Hant",
             "zh-TW",
-            "zh-Hans",
             "zh",
-            "zh-HK",
             "en",
-            "ja",
-            "ko",
-            "es",
-            "fr",
-            "de",
-            "it",
-            "pt",
-            "ru",
+            "en-US",
+        ],  # 優先抓繁中，沒有就抓英文
+        "outtmpl": file_prefix,  # 輸出檔名模板
+        "quiet": True,
+        "noplaylist": True,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts_sub) as ydl:
+            ydl.download([url])
+
+        # 檢查下載了什麼檔案 (.vtt)
+        # yt-dlp 會自動加上語言後綴，例如 sub_xxx.zh-Hant.vtt 或 sub_xxx.en.vtt
+        generated_files = [
+            f
+            for f in os.listdir(".")
+            if f.startswith(file_prefix) and f.endswith(".vtt")
         ]
 
-        loader = YoutubeLoader.from_youtube_url(
-            url, add_video_info=False, language=common_languages
-        )
-        docs = loader.load()
+        if generated_files:
+            # 找到字幕檔了！
+            sub_file = generated_files[0]  # 抓第一個找到的
+            logs.append(f"✅ 成功下載字幕檔: {sub_file}")
 
-        if docs:
-            transcript = docs[0].page_content
-            print(f"✅ 成功抓取字幕，長度: {len(transcript)} 字")
-            return {
-                "content": f"【影片字幕】：\n{transcript}",
-                "file_obj": None,
-                "error": None,
-            }
+            # 讀取並清洗 VTT 格式 (去除時間軸，只留文字)
+            clean_text = []
+            with open(sub_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    # 過濾掉 WEBVTT 標頭、空行、時間軸 (例如 00:00:01.000 --> ...)
+                    if "-->" in line or line == "WEBVTT" or not line:
+                        continue
+                    # 過濾掉重複的行 (有些字幕會重複上一句)
+                    if clean_text and clean_text[-1] == line:
+                        continue
+                    # 移除一些 HTML 標籤 (如 <c.colorE5E5E5>)
+                    line = re.sub(r"<[^>]+>", "", line)
+                    if line:
+                        clean_text.append(line)
+
+            # 刪除暫存的 .vtt 檔
+            for f in generated_files:
+                os.remove(f)
+
+            full_transcript = "\n".join(clean_text)
+
+            # 檢查字數，如果太少可能是空的
+            if len(full_transcript) > 50:
+                msg = f"✅ 字幕清洗完成，長度: {len(full_transcript)} 字"
+                logs.append(msg)
+                return {
+                    "content": f"【影片字幕】：\n{full_transcript}",
+                    "file_obj": None,
+                    "error": None,
+                    "logs": logs,
+                }
+            else:
+                logs.append("⚠️ 下載的字幕內容過短，視為失敗。")
+        else:
+            logs.append("⚠️ yt-dlp 執行完畢但未發現字幕檔 (可能該影片無字幕)。")
 
     except Exception as e:
-        print(f"⚠️ 字幕抓取失敗 (將嘗試 Plan B): {e}")
+        logs.append(f"⚠️ Plan A 字幕下載失敗: {e}")
+        # 清理可能殘留的檔案
+        for f in os.listdir("."):
+            if f.startswith(file_prefix):
+                try:
+                    os.remove(f)
+                except:
+                    pass
 
-    # === Plan B: 下載音訊並「聽」內容 ===
-    print("2. 啟動 Plan B：下載音訊 (Gemini 聽力模式)...")
+    # === Plan B: 音訊 (Gemini 聽力模式) ===
+    if not current_key:
+        err = "無字幕且未提供 API Key，無法進行音訊處理。"
+        logs.append(f"❌ {err}")
+        return {"error": err, "content": None, "logs": logs}
 
-    # 設定下載檔名 (暫存)
-    temp_audio_file = "temp_audio.m4a"
-
-    # yt-dlp 設定：只下載最好的音訊，並存成 m4a
-    ydl_opts = {
-        "format": "bestaudio[ext=m4a]/best[ext=mp4]/best",
+    logs.append("⚠️ 啟動 Plan B：下載音訊 (Gemini 聽力模式)...")
+    temp_audio_file = f"audio_{uuid.uuid4().hex[:8]}.m4a"
+    ydl_opts_audio = {
+        "format": "bestaudio[ext=m4a]/best",
         "outtmpl": temp_audio_file,
         "quiet": True,
         "noplaylist": True,
     }
 
     try:
-        # 1. 下載音訊
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(ydl_opts_audio) as ydl:
             ydl.download([url])
-        print(f"✅ 音訊下載完成: {temp_audio_file}")
-
-        # 2. 上傳到 Gemini
-        print("3. 正在上傳音訊到 Google Gemini...")
+        logs.append("音訊下載完成，正在上傳到 Gemini...")
         audio_file = genai.upload_file(path=temp_audio_file)
-        print(f"✅ 上傳成功，File URI: {audio_file.uri}")
 
-        # 3. 刪除本地暫存檔 (保持環境乾淨)
         if os.path.exists(temp_audio_file):
             os.remove(temp_audio_file)
 
-        # 回傳 file_obj 讓下一個節點使用
-        return {"content": None, "file_obj": audio_file, "error": None}
-
+        logs.append(f"✅ 上傳成功 (URI: {audio_file.uri})")
+        return {"content": None, "file_obj": audio_file, "error": None, "logs": logs}
     except Exception as e:
-        print(f"❌ Plan B 失敗: {e}")
+        logs.append(f"❌ YouTube 音訊處理也失敗: {str(e)}")
+        return {"error": str(e), "content": None, "file_obj": None, "logs": logs}
+
+
+# --- 7. 節點：網頁 ---
+def load_web_node(state: OmniState) -> Dict[str, Any]:
+    logs = ["--- [節點 2-B] 處理網頁 ---"]
+    try:
+        loader = WebBaseLoader(state["input_text"])
+        docs = loader.load()
+        if not docs:
+            return {
+                "error": "網頁抓取為空",
+                "content": None,
+                "logs": logs + ["❌ 網頁抓取為空"],
+            }
+        clean_content = re.sub(r"\n\s*\n", "\n\n", docs[0].page_content)
+        logs.append(f"✅ 成功抓取網頁，長度: {len(clean_content)} 字")
+        return {"content": clean_content, "error": None, "logs": logs}
+    except Exception as e:
         return {
-            "error": f"YouTube 字幕與音訊皆失敗: {str(e)}",
+            "error": str(e),
             "content": None,
-            "file_obj": None,
+            "logs": logs + [f"❌ 網頁處理失敗: {str(e)}"],
         }
 
 
-# --- 7. 節點 (Node)：網頁載入器 ---
-def load_web_node(state: OmniState) -> Dict[str, Any]:
-    print("\n--- [節點 2-B] 處理網頁 ---")
-    url = state["input_text"]
-
-    try:
-        # 使用 WebBaseLoader 抓取網頁
-        loader = WebBaseLoader(url)
-        docs = loader.load()
-
-        if not docs:
-            return {"error": "網頁抓取為空", "content": None}
-
-        # 簡單清洗：去除多餘換行
-        raw_content = docs[0].page_content
-        clean_content = re.sub(r"\n\s*\n", "\n\n", raw_content)  # 把多個空行變成一個
-
-        print(f"成功抓取網頁，長度: {len(clean_content)} 字")
-        return {"content": clean_content, "error": None}
-
-    except Exception as e:
-        print(f"網頁載入失敗: {e}")
-        return {"error": f"網頁處理失敗: {str(e)}", "content": None}
-
-
-# --- 8. 節點 (Node)：純文字處理 (透傳) ---
+# --- 8. 節點：純文字 ---
 def load_text_node(state: OmniState) -> Dict[str, Any]:
-    print("\n--- [節點 2-C] 處理純文字 ---")
-    # 如果使用者直接貼文章，就直接當作 content
-    return {"content": state["input_text"], "error": None}
+    return {
+        "content": state["input_text"],
+        "error": None,
+        "logs": ["--- [節點 2-C] 處理純文字 ---"],
+    }
 
 
-# --- 9. 節點 (Node)：摘要生成器 (AI 大腦) ---
+# --- 9. 節點：摘要生成 ---
 def generate_summary_node(state: OmniState) -> Dict[str, Any]:
-    print("\n--- [節點 3] AI 正在撰寫摘要 ---")
+    logs = ["\n--- [節點 3] AI 正在撰寫摘要 ---"]
 
-    # 1. 檢查前一步驟是否有錯誤
     if state.get("error") and not state.get("file_obj"):
-        print("偵測到前一步驟錯誤且無備用檔案，跳過生成。")
-        return {"summary": f"無法生成摘要，原因：{state['error']}"}
+        return {
+            "summary": f"無法生成: {state['error']}",
+            "logs": logs + ["偵測到前一步驟錯誤，跳過。"],
+        }
 
-    # 2. 初始化 Gemini
-    # 注意：這裡一定要傳入 google_api_key
+    # 【API Key 檢查與回報】
+    current_key = state.get("api_key") or default_api_key
+    if not current_key:
+        return {
+            "summary": "錯誤：未設定 API Key",
+            "error": "No API Key",
+            "logs": logs + ["❌ 錯誤：找不到 API Key"],
+        }
+
+    # 顯示目前使用的 Key 來源 (遮罩處理)
+    key_source = "手動輸入" if state.get("api_key") else "預設 .env"
+    masked_key = current_key[:4] + "*" * 10 + current_key[-4:]
+    logs.append(f"🔑 使用 Key: {masked_key} ({key_source})")
+
+    genai.configure(api_key=current_key)
     llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash-lite", google_api_key=my_api_key
+        model="gemini-2.5-flash-lite", google_api_key=current_key
     )
 
-    # 3. 設定提示詞 (Prompt)
-    # 我們明確要求：不管原文是什麼，都要用繁體中文回答
     base_requirements = (
         "你是一位全能的資訊整理專家。請為我撰寫一份「懶人包摘要」。"
-        "\n\n"
-        "【要求】：\n"
-        "1. **語言**：無論原文是哪國語言，請全部翻譯並整理成 **繁體中文 (Traditional Chinese)**。\n"
-        "2. **格式**：\n"
+        "\n\n【要求】：\n"
+        "1. **檔名指令(重要)**：請根據內容，取一個最適合存檔的檔名。並在回應的**第一行**，嚴格依照此格式輸出：`# 檔名：[你的檔名]`。\n"
+        "2. **直接輸出**：請直接開始輸出內容，**絕對不要**有任何開場白（如「好的」、「這是我整理的...」等廢話）。\n"
+        "3. **語言**：全部翻譯並整理成 **繁體中文**。\n"
+        "4. **格式**：\n"
         "   - **一言以蔽之**：用一句話總結核心主旨。\n"
         "   - **關鍵重點**：列出 3-5 個最重要的資訊點 (Bullet points)。\n"
         "   - **詳細摘要**：針對內容進行邏輯分段的詳細說明。\n"
-        "3. **語氣**：專業但輕鬆，適合快速閱讀。"
+        "5. **語氣**：專業但輕鬆。"
     )
 
     try:
         messages = []
-
-        # === 判斷輸入來源 ===
         if state.get("file_obj"):
-            # 【情況 A】：有檔案 (音訊)
-            print("模式：聽覺處理 (Audio Processing)")
-
-            # --- 增加 Debug 資訊 ---
+            logs.append("模式：聽覺處理 (Audio)")
             file_obj = state["file_obj"]
-            print(f"DEBUG: 檔案 URI: {file_obj.uri}")
-            print(f"DEBUG: 檔案類型: {file_obj.mime_type}")
-
-            # 確保檔案已經處理完成 (通常音訊很快，但檢查一下比較保險)
-            import time
-
             while file_obj.state.name == "PROCESSING":
-                print("DEBUG: Google 正在處理檔案中，等待 2 秒...")
-                time.sleep(2)
-                file_obj = genai.get_file(file_obj.name)  # 重新整理狀態
+                time.sleep(1)
+                file_obj = genai.get_file(file_obj.name)
 
             if file_obj.state.name == "FAILED":
-                raise ValueError("Google 無法處理此音訊檔案")
+                raise ValueError("Google 處理檔案失敗")
 
-            # 針對音訊的提示詞 (不能有 {content} 佔位符)
-            audio_prompt = base_requirements + "\n\n請根據附檔的音訊內容進行摘要。"
-
-            # 這是 LangChain 傳遞多模態檔案的標準寫法
-            message = HumanMessage(
-                content=[
-                    {"type": "text", "text": audio_prompt},
-                    {
-                        "type": "media",
-                        "mime_type": file_obj.mime_type,
-                        "file_uri": file_obj.uri,
-                    },
-                ]
-            )
-            messages = [message]
-
+            audio_prompt = base_requirements + "\n\n請根據附檔音訊摘要。"
+            messages = [
+                HumanMessage(
+                    content=[
+                        {"type": "text", "text": audio_prompt},
+                        {
+                            "type": "media",
+                            "mime_type": file_obj.mime_type,
+                            "file_uri": file_obj.uri,
+                        },
+                    ]
+                )
+            ]
         elif state.get("content"):
-            # 【情況 B】：有文字 (字幕/網頁)
-            print("模式：文字閱讀 (Text Processing)")
-
-            # 針對文字的提示詞 (把內容填進去)
-            source = state.get("source_type", "unknown")
+            logs.append("模式：文字閱讀 (Text)")
             text_prompt = (
                 base_requirements
-                + f"\n\n來源類型：{source}\n【內容】：\n{state['content']}"
+                + f"\n\n來源：{state.get('source_type')}\n【內容】：\n{state['content']}"
             )
-
             messages = [HumanMessage(content=text_prompt)]
-
         else:
-            return {"summary": "錯誤：沒有內容也沒有檔案可以處理。"}
+            return {"summary": "無內容可處理", "logs": logs}
 
-        # 呼叫 AI
-        print("正在呼叫 Gemini 生成摘要 (這可能需要幾秒鐘)...")
+        logs.append("🚀 正在呼叫 Gemini 生成摘要...")
         response = llm.invoke(messages)
-
-        print("摘要生成完成！")
-        return {"summary": response.content}
-
+        logs.append("✅ 摘要生成完成！")
+        return {"summary": response.content, "logs": logs}
     except Exception as e:
-        print(f"AI 生成失敗: {e}")
-        return {"summary": f"AI 生成失敗: {str(e)}", "error": str(e)}
+        return {
+            "summary": f"AI 生成失敗: {str(e)}",
+            "error": str(e),
+            "logs": logs + [f"❌ AI 生成失敗: {str(e)}"],
+        }
 
 
-# --- 10. 條件邊邏輯 (Router Logic) ---
+# --- 10. 路由與組裝 ---
 def route_based_on_source(state: OmniState) -> str:
-    """決定分析完輸入後，要走哪條路"""
     source = state["source_type"]
     if source == "youtube":
         return "process_youtube"
@@ -297,21 +329,14 @@ def route_based_on_source(state: OmniState) -> str:
         return "process_text"
 
 
-# --- 11. 組裝 LangGraph ---
-
 workflow = StateGraph(OmniState)
-
-# (1) 加入所有節點
 workflow.add_node("analyze_node", analyze_input_node)
 workflow.add_node("youtube_node", load_youtube_node)
 workflow.add_node("web_node", load_web_node)
 workflow.add_node("text_node", load_text_node)
 workflow.add_node("summarize_node", generate_summary_node)
 
-# (2) 設定起點
 workflow.set_entry_point("analyze_node")
-
-# (3) 設定條件邊 (從分析節點出發，分三路)
 workflow.add_conditional_edges(
     "analyze_node",
     route_based_on_source,
@@ -321,53 +346,9 @@ workflow.add_conditional_edges(
         "process_text": "text_node",
     },
 )
-
-# (4) 設定匯聚邊 (三條路最後都匯聚到 摘要節點)
 workflow.add_edge("youtube_node", "summarize_node")
 workflow.add_edge("web_node", "summarize_node")
 workflow.add_edge("text_node", "summarize_node")
-
-# (5) 設定終點
 workflow.add_edge("summarize_node", END)
 
-# (6) 編譯應用程式
 app = workflow.compile()
-
-
-# --- 12. 最終執行測試 ---
-if __name__ == "__main__":
-    print("\n🚀 OmniSummarizer V1 啟動！")
-
-    # --- 測試案例 ---
-    # 案例 A: 你的 YouTube 影片 (測試多語言翻譯能力 + 字幕抓取)
-    input_data = "https://www.youtube.com/watch?v=YTiBMEzU9Vc"
-
-    # 案例 B: 網頁 (你可以把上面註解掉，換測這個)
-    # input_data = "https://blog.langchain.dev/langgraph-multi-agent-workflows/"
-
-    print(f"正在處理: {input_data}")
-
-    inputs = {
-        "input_text": input_data,
-        "source_type": "",
-        "content": None,
-        "summary": None,
-        "error": None,
-        "file_obj": None,
-    }
-
-    try:
-        # 執行 LangGraph
-        result = app.invoke(inputs)
-
-        print("\n\n" + "=" * 30)
-        print("🌟 最終懶人包產出 🌟")
-        print("=" * 30 + "\n")
-
-        if result["error"]:
-            print(f"❌ 發生錯誤: {result['error']}")
-        else:
-            print(result["summary"])
-
-    except Exception as e:
-        print(f"程式執行錯誤: {e}")
