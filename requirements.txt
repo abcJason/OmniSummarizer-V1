@@ -1,3 +1,13 @@
+gradio
+langchain
+langchain-community
+langchain-google-genai
+langgraph
+google-generativeai
+yt-dlp
+beautifulsoup4
+python-dotenv
+
 aiofiles==24.1.0
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.2

@@ -87,8 +87,13 @@ def load_youtube_node(state: OmniState) -> Dict[str, Any]:
             "zh",
             "zh-HK",
             "en",
+            "en-US",
+            "en-GB",
             "ja",
             "ko",
+            "es",
+            "fr",
+            "de",
         ]
         loader = YoutubeLoader.from_youtube_url(
             url, add_video_info=False, language=common_languages
